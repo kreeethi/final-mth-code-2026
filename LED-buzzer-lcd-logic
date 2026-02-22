@@ -1,0 +1,310 @@
+#include <LiquidCrystal.h>
+LiquidCrystal lcd(12, 11, 5, 4, 3, 2);
+
+// ----- Pins -----
+const int DRIP_PIN  = A0;
+const int LEVEL_PIN = A1;
+
+// Indicator outputs
+const int LED_GREEN  = 6;
+const int LED_YELLOW = 7;
+const int LED_RED    = 8;
+const int BUZZER     = 9;
+
+// ----- Timing -----
+const unsigned long SAMPLE_DELAY_MS = 5;
+const unsigned long RATE_WINDOW_MS  = 5000;   // update every 5s
+const unsigned long LCD_UPDATE_MS   = 250;
+
+// ----- Drip detection (dip when blocked) -----
+int dripBaseline = 0;
+int dripThresholdLow = 0;
+const unsigned long DROP_COOLDOWN_MS = 250;
+const unsigned long NO_DROP_CRITICAL_MS = 8000;
+
+// ----- Water level progressive calibration -----
+int levelEmpty = 0;
+int levelFull  = 0;
+
+// Smoothing for displayed percent
+float levelFiltered = 0;
+float levelAlpha = 0.3f;
+
+// ----- State -----
+unsigned long lastDropTime = 0;
+unsigned long lastCountedDrop = 0;
+
+int windowDrops = 0;
+unsigned long windowStart = 0;
+
+float rateHist[3] = {0, 0, 0};
+int rateIdx = 0;
+
+float dripRate = 0;
+
+unsigned long lastLCD = 0;
+
+// Three-state enum
+enum StatusState { NORMAL_STATE, WARNING_STATE, CRITICAL_STATE };
+StatusState currentState = NORMAL_STATE;
+
+// ----- Helpers -----
+float clampf(float x, float lo, float hi) {
+  if (x < lo) return lo;
+  if (x > hi) return hi;
+  return x;
+}
+
+float safePercent(float raw) {
+  int denom = levelFull - levelEmpty;
+  if (denom < 5) return 0.0f;
+  float pct = 100.0f * (raw - levelEmpty) / (float)denom;
+  return clampf(pct, 0.0f, 100.0f);
+}
+
+const char* stateShort(StatusState s) {
+  if (s == CRITICAL_STATE) return "CRIT";
+  if (s == WARNING_STATE)  return "WARN";
+  return "NORM";
+}
+
+void setIndicators(StatusState s) {
+  // LEDs
+  digitalWrite(LED_GREEN,  (s == NORMAL_STATE)  ? HIGH : LOW);
+  digitalWrite(LED_YELLOW, (s == WARNING_STATE) ? HIGH : LOW);
+  digitalWrite(LED_RED,    (s == CRITICAL_STATE)? HIGH : LOW);
+
+  // Buzzer: beep pattern only for CRITICAL
+  // Non-blocking: toggles every 250 ms
+  static unsigned long lastBeep = 0;
+  static bool beepOn = false;
+
+  if (s == CRITICAL_STATE) {
+    if (millis() - lastBeep > 500) {
+      lastBeep = millis();
+      beepOn = !beepOn;
+    }
+
+    if (beepOn) tone(BUZZER, 2000);
+    else noTone(BUZZER);
+
+  } else {
+    noTone(BUZZER);
+  }
+}
+
+void showTwoLine(const char* a, const char* b) {
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print(a);
+  lcd.setCursor(0, 1);
+  lcd.print(b);
+}
+
+void calibrateDrip() {
+  showTwoLine("Cal drip 3s", "Hold steady");
+  Serial.println("CALIBRATING DRIP (3 seconds). Keep LED/sensor steady. No blocking.");
+
+  long sum = 0;
+  int minV = 1023;
+  int maxV = 0;
+  int samples = 0;
+
+  unsigned long t0 = millis();
+  while (millis() - t0 < 3000) {
+    int v = analogRead(DRIP_PIN);
+    sum += v;
+    if (v < minV) minV = v;
+    if (v > maxV) maxV = v;
+    samples++;
+    delay(SAMPLE_DELAY_MS);
+  }
+
+  dripBaseline = (int)(sum / samples);
+  int noiseRange = maxV - minV;
+
+  int margin = 30; // tune 20–60
+  dripThresholdLow = dripBaseline - noiseRange - margin;
+
+  Serial.print("Drip baseline=");
+  Serial.print(dripBaseline);
+  Serial.print(" noiseRange=");
+  Serial.print(noiseRange);
+  Serial.print(" thresholdLow=");
+  Serial.println(dripThresholdLow);
+
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("Base:");
+  lcd.print(dripBaseline);
+  lcd.setCursor(0, 1);
+  lcd.print("ThrL:");
+  lcd.print(dripThresholdLow);
+  delay(1200);
+}
+
+void initLevelProgressive() {
+  levelEmpty = analogRead(LEVEL_PIN);
+  levelFull  = levelEmpty + 1; // avoid divide-by-zero
+  levelFiltered = levelEmpty;
+
+  Serial.print("Level empty init=");
+  Serial.println(levelEmpty);
+
+  showTwoLine("Level init done", "Fill learns max");
+  delay(900);
+  lcd.clear();
+}
+
+void setup() {
+  Serial.begin(9600);
+
+  pinMode(LED_GREEN, OUTPUT);
+  pinMode(LED_YELLOW, OUTPUT);
+  pinMode(LED_RED, OUTPUT);
+  pinMode(BUZZER, OUTPUT);
+
+  lcd.begin(16, 2);
+  showTwoLine("IV Monitor", "Starting...");
+  delay(800);
+
+  calibrateDrip();
+  initLevelProgressive();
+
+  windowStart = millis();
+  lastDropTime = millis();
+  lastCountedDrop = 0;
+
+  currentState = NORMAL_STATE;
+  setIndicators(currentState);
+}
+
+void loop() {
+  unsigned long now = millis();
+
+  // ----- Read sensors -----
+  int dripRaw = analogRead(DRIP_PIN);
+  int levelRaw = analogRead(LEVEL_PIN);
+
+  // Progressive calibration: learn max as you fill
+  if (levelRaw > levelFull) levelFull = levelRaw;
+
+  // Smooth for display
+  levelFiltered = levelAlpha * levelFiltered + (1.0f - levelAlpha) * levelRaw;
+  float levelPct = safePercent(levelFiltered);
+
+  // ----- Drop detection (dip) -----
+  if (dripRaw < dripThresholdLow) {
+    if (now - lastCountedDrop > DROP_COOLDOWN_MS) {
+      lastCountedDrop = now;
+      lastDropTime = now;
+      windowDrops++;
+    }
+  }
+
+  bool noDropTooLong = (now - lastDropTime) > NO_DROP_CRITICAL_MS;
+
+  // ----- Compute state every window -----
+  static bool decreasingTrend = false;
+  static bool occlusionSuspected = false;
+  static bool levelLow = false;
+  static bool levelCritical = false;
+  static float minutesToEmpty = -1.0f;
+
+  if (now - windowStart >= RATE_WINDOW_MS) {
+    dripRate = windowDrops * (60000.0f / RATE_WINDOW_MS);
+
+    // history for trend
+    rateHist[rateIdx] = dripRate;
+    rateIdx = (rateIdx + 1) % 3;
+
+    float a = rateHist[0], b = rateHist[1], c = rateHist[2];
+    decreasingTrend = (a > b + 2.0f) && (b > c + 2.0f) && (c > 0.0f);
+
+    levelLow = (levelPct < 20.0f);
+    levelCritical = (levelPct < 10.0f);
+
+    occlusionSuspected = decreasingTrend && (levelPct > 30.0f);
+
+    // rough time-to-empty (demo-only)
+    float assumedMlPerDrop = 0.05f;
+    float assumedBagMl = 500.0f;
+    float mlPerMin = dripRate * assumedMlPerDrop;
+    float remainingMl = (levelPct / 100.0f) * assumedBagMl;
+    minutesToEmpty = (mlPerMin > 0.1f) ? (remainingMl / mlPerMin) : -1.0f;
+
+    // Decide state (priority: critical > warning > normal)
+    if (noDropTooLong || levelCritical) {
+      currentState = CRITICAL_STATE;
+    } else if (levelLow || decreasingTrend || occlusionSuspected) {
+      currentState = WARNING_STATE;
+    } else {
+      currentState = NORMAL_STATE;
+    }
+
+    // Serial summary
+    Serial.print("[");
+    Serial.print(stateShort(currentState));
+    Serial.print("] rate=");
+    Serial.print(dripRate, 1);
+    Serial.print(" dpm | lvl=");
+    Serial.print(levelPct, 0);
+    Serial.print("% (max=");
+    Serial.print(levelFull);
+    Serial.print(") ");
+
+    if (minutesToEmpty > 0) {
+      Serial.print("| t_empty~");
+      Serial.print(minutesToEmpty, 0);
+      Serial.print("m ");
+    }
+    if (occlusionSuspected) Serial.print("| OCC? ");
+    else if (decreasingTrend) Serial.print("| trend ");
+    if (levelLow && !levelCritical) Serial.print("| low ");
+    if (noDropTooLong) Serial.print("| NODROP ");
+
+    Serial.println();
+
+    // reset window
+    windowDrops = 0;
+    windowStart = now;
+  }
+
+  // ----- Update outputs continuously -----
+  setIndicators(currentState);
+
+  // ----- LCD update -----
+  if (now - lastLCD >= LCD_UPDATE_MS) {
+    lastLCD = now;
+
+    // Line 1: state + rate
+    lcd.setCursor(0, 0);
+    lcd.print(stateShort(currentState));
+    lcd.print(" R:");
+    lcd.print(dripRate, 0);
+    lcd.print("dpm   ");
+
+    // Line 2: level + alert tag
+    lcd.setCursor(0, 1);
+    lcd.print("L:");
+    lcd.print(levelPct, 0);
+    lcd.print("% ");
+
+    if (minutesToEmpty > 0) {
+      lcd.print("T~");
+      lcd.print(minutesToEmpty, 0);
+      lcd.print("m ");
+    } else {
+      lcd.print("T:-- ");
+    }
+
+    // Small tag at end
+    if (currentState == CRITICAL_STATE) lcd.print("!");
+    else if (occlusionSuspected) lcd.print("OCC");
+    else if (levelLow) lcd.print("LOW");
+    else if (decreasingTrend) lcd.print("TRN");
+    else lcd.print("   ");
+  }
+
+  delay(SAMPLE_DELAY_MS);
+}
